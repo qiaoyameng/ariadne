@@ -136,6 +136,33 @@ def resolve_product_reference(_, _info, representation):
 ```
 
 
+### Batch reference resolvers
+
+By default, Ariadne calls the reference resolver once for every representation sent by the gateway, which may result in N+1 queries to your data source. To avoid that, you can register a batch reference resolver with `batch_reference_resolver`:
+
+```python
+# service_products.py
+from ariadne.contrib.federation import FederatedObjectType
+
+
+product = FederatedObjectType("Product")
+
+@product.batch_reference_resolver
+def resolve_products_reference(_, _info, representations):
+    upcs = [representation["upc"] for representation in representations]
+    return get_products_by_upcs(upcs)  # single query to the data source
+```
+
+A batch reference resolver is called once per `_entities` request with a list of all representations for its type, in the order they appeared in the request. It must return a list with exactly one result per representation, in the same order. Both synchronous and asynchronous (`async def`) batch resolvers are supported, and a result may be `None` for representations that don't match any entity.
+
+If a batch reference resolver returns a list with a different length than the number of representations, an error is reported for every representation of that type. Results are never silently truncated or skipped.
+
+Individual results may also be `Exception` instances. In that case the corresponding position in the `_entities` result is `None` and the exception is reported as a GraphQL error with a path pointing at that position, while other results are returned normally. If the batch resolver itself raises an exception, all positions of that type in the `_entities` result are reported as errors.
+
+When both `reference_resolver` and `batch_reference_resolver` are registered for the same type, the batch resolver takes precedence and the single reference resolver is not called.
+
+Batch reference resolvers are scoped to a single request: representations and results are never shared between concurrent requests.
+
 
 ```python
 # service_reviews.py

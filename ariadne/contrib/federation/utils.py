@@ -1,3 +1,4 @@
+import asyncio
 from inspect import isawaitable
 from typing import Any, cast
 
@@ -78,8 +79,10 @@ def purge_schema_directives(joined_type_defs: str) -> str:
 def resolve_entities(_: Any, info: GraphQLResolveInfo, **kwargs) -> Any:
     representations = list(kwargs.get("representations", []))
 
-    result = []
-    for reference in representations:
+    results: list[Any] = [None] * len(representations)
+    batched_typenames: dict[str, tuple[GraphQLObjectType, Any, list[int]]] = {}
+
+    for index, reference in enumerate(representations):
         __typename = reference["__typename"]
         type_object = info.schema.get_type(__typename)
 
@@ -90,6 +93,19 @@ def resolve_entities(_: Any, info: GraphQLResolveInfo, **kwargs) -> Any:
                 f" was found in the schema",
             )
 
+        batch_resolver = type_get_extension(
+            type_object,
+            "__resolve_references__",
+            None,
+        )
+
+        if batch_resolver is not None:
+            if __typename in batched_typenames:
+                batched_typenames[__typename][2].append(index)
+            else:
+                batched_typenames[__typename] = (type_object, batch_resolver, [index])
+            continue
+
         resolve_reference = type_get_extension(
             type_object,
             "__resolve_reference__",
@@ -99,11 +115,103 @@ def resolve_entities(_: Any, info: GraphQLResolveInfo, **kwargs) -> Any:
         representation = resolve_reference(type_object, info, reference)
 
         if isawaitable(representation):
-            result.append(add_typename_to_async_return(representation, __typename))
+            results[index] = add_typename_to_async_return(representation, __typename)
         else:
-            result.append(add_typename_to_possible_return(representation, __typename))
+            results[index] = add_typename_to_possible_return(representation, __typename)
 
-    return result
+    for __typename, (type_object, batch_resolver, indices) in batched_typenames.items():
+        resolve_entities_batch(
+            type_object,
+            batch_resolver,
+            [representations[index] for index in indices],
+            indices,
+            results,
+            __typename,
+            info,
+        )
+
+    return results
+
+
+def resolve_entities_batch(
+    type_object: GraphQLObjectType,
+    batch_resolver: Any,
+    references: list[Any],
+    indices: list[int],
+    results: list[Any],
+    __typename: str,
+    info: GraphQLResolveInfo,
+) -> None:
+    try:
+        batch = batch_resolver(type_object, info, references)
+    except Exception as error:
+        for index in indices:
+            results[index] = raise_entity_error(error)
+        return
+
+    if isawaitable(batch):
+        shared_batch = asyncio.ensure_future(
+            await_validated_batch(batch, __typename, len(indices))
+        )
+        for position, index in enumerate(indices):
+            results[index] = resolve_entity_from_batch(
+                shared_batch, position, __typename
+            )
+        return
+
+    try:
+        validate_batch_results(batch, __typename, len(indices))
+    except Exception as error:
+        for index in indices:
+            results[index] = raise_entity_error(error)
+        return
+
+    for position, index in enumerate(indices):
+        entity = batch[position]
+        if isinstance(entity, Exception):
+            results[index] = raise_entity_error(entity)
+        else:
+            results[index] = add_typename_to_possible_return(entity, __typename)
+
+
+async def await_validated_batch(
+    batch: Any, __typename: str, expected_count: int
+) -> list[Any]:
+    return validate_batch_results(await batch, __typename, expected_count)
+
+
+async def resolve_entity_from_batch(
+    shared_batch: "asyncio.Future[list[Any]]",
+    position: int,
+    __typename: str,
+) -> Any:
+    batch = await shared_batch
+    entity = batch[position]
+    if isinstance(entity, Exception):
+        raise entity
+    return add_typename_to_possible_return(entity, __typename)
+
+
+async def raise_entity_error(error: Exception) -> Any:
+    raise error
+
+
+def validate_batch_results(
+    batch: Any, __typename: str, expected_count: int
+) -> list[Any]:
+    if not isinstance(batch, list | tuple) or len(batch) != expected_count:
+        returned = (
+            f"{len(batch)} results"
+            if isinstance(batch, list | tuple)
+            else f"{type(batch).__name__} instead of a list"
+        )
+        raise ValueError(
+            f'Batch reference resolver for type "{__typename}" returned '
+            f"{returned}, but {expected_count} representations were sent. "
+            "Batch reference resolvers must return a list with exactly one "
+            "result per representation, in the same order."
+        )
+    return list(batch)
 
 
 async def add_typename_to_async_return(obj: Any, typename: str) -> Any:

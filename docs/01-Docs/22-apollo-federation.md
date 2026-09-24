@@ -269,6 +269,34 @@ query {
 Fully working demo is available on [GitHub](https://github.com/bogdal/ariadne-federation-demo).
 
 
+## Batch reference resolvers
+
+By default, Ariadne calls the reference resolver once for every representation sent by the gateway in an `_entities` query. When the gateway sends many representations at once, this may result in an N+1 query problem against your database or another upstream service.
+
+To avoid this, `FederatedObjectType` lets you register a batch reference resolver with the `batch_reference_resolver` decorator. For each `_entities` request, Ariadne groups representations by their `__typename` and calls the batch reference resolver once per type, passing all its representations as a list, in the order they appeared in the request:
+
+```python
+# service_products.py
+from ariadne.contrib.federation import FederatedObjectType
+
+
+product = FederatedObjectType("Product")
+
+@product.batch_reference_resolver
+def resolve_product_references(_, _info, representations):
+    upcs = [representation["upc"] for representation in representations]
+    return get_products_by_upcs(upcs)  # single database query
+```
+
+The batch reference resolver must return a list of results with the same length and order as the representations it received. Each result is matched back to its original position in the `_entities` result list, so mixing entity types or repeating the same representation in a single request is safe. Returning a list of a different length raises a `TypeError`, as this indicates a bug in the resolver.
+
+Batch reference resolvers may also be `async` functions, and may return `None` for individual positions to signal that an entity doesn't exist. Returning an `Exception` instance for a position converts it into a GraphQL error for that `_entities` list element only, leaving other results intact. If the batch reference resolver itself raises an exception, the error is reported on every position of that type's batch.
+
+If a type has both `reference_resolver` and `batch_reference_resolver` registered, the batch reference resolver takes precedence and the single reference resolver is not called.
+
+Batches are created per request and are never shared between concurrent requests.
+
+
 ## Creating new project from a template
 
 Our friends from [Apollo Graph](https://apollographql.com/) have contributed and are maintaining a rover template for quickly starting with new GraphQL service with Ariadne and FastAPI that can be included in your federation.

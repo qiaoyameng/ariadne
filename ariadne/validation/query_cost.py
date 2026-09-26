@@ -4,15 +4,20 @@ from typing import Any, cast
 
 from graphql import (
     GraphQLError,
+    GraphQLIncludeDirective,
     GraphQLInterfaceType,
     GraphQLNamedType,
     GraphQLObjectType,
     GraphQLSchema,
+    GraphQLSkipDirective,
+    GraphQLUnionType,
+    get_directive_values,
     get_named_type,
 )
-from graphql.execution.values import get_argument_values
+from graphql.execution.values import get_argument_values, get_variable_values
 from graphql.language import (
     BooleanValueNode,
+    DocumentNode,
     FieldNode,
     FragmentDefinitionNode,
     FragmentSpreadNode,
@@ -22,6 +27,7 @@ from graphql.language import (
     Node,
     OperationDefinitionNode,
     OperationType,
+    SelectionNode,
     StringValueNode,
 )
 from graphql.type import GraphQLFieldMap
@@ -50,6 +56,8 @@ class CostValidator(ValidationRule):
     default_complexity: int = 1
     variables: dict | None = None
     cost_map: dict[str, dict[str, Any]] | None = None
+    operation_aware: bool = False
+    operation_name: str | None = None
 
     def __init__(
         self,
@@ -60,18 +68,25 @@ class CostValidator(ValidationRule):
         default_complexity: int = 1,
         variables: dict | None = None,
         cost_map: dict[str, dict[str, Any]] | None = None,
+        operation_aware: bool = False,
+        operation_name: str | None = None,
     ) -> None:
         super().__init__(context)
 
         self.maximum_cost = maximum_cost
         self.variables = variables
         self.cost_map = cost_map
+        self.operation_aware = operation_aware
+        self.operation_name = operation_name
         self.default_cost = default_cost
         self.default_complexity = default_complexity
         self.cost = 0
         self.operation_multipliers: list[Any] = []
         self._fragment_cost_coefficients: dict[
             tuple[str, str | None], tuple[int, int]
+        ] = {}
+        self._operation_aware_fragment_costs: dict[
+            tuple[str, str | None, int], int
         ] = {}
 
     def compute_node_cost(  # noqa C901
@@ -200,6 +215,9 @@ class CostValidator(ValidationRule):
         return coefficients
 
     def enter_operation_definition(self, node, key, parent, path, ancestors):
+        if self.operation_aware:
+            return
+
         if self.cost_map:
             try:
                 validate_cost_map(self.cost_map, self.context.schema)
@@ -217,8 +235,320 @@ class CostValidator(ValidationRule):
             )
 
     def leave_operation_definition(self, node, key, parent, path, ancestors):
+        if self.operation_aware:
+            return
+
         if self.cost > self.maximum_cost:
             self.context.report_error(self.get_cost_exceeded_error())
+
+    def enter_document(self, node, key, parent, path, ancestors):
+        if not self.operation_aware:
+            return
+
+        if self.cost_map:
+            try:
+                validate_cost_map(self.cost_map, self.context.schema)
+            except GraphQLError as cost_map_error:
+                self.context.report_error(cost_map_error)
+                return
+
+        operation = self.get_operation_to_execute(node)
+        if operation is None:
+            return
+
+        coerced_variables = self.get_coerced_variables(operation)
+        if coerced_variables is None:
+            return
+
+        schema = self.context.schema
+        root_type = None
+        if operation.operation is OperationType.QUERY:
+            root_type = schema.query_type
+        if operation.operation is OperationType.MUTATION:
+            root_type = schema.mutation_type
+        if operation.operation is OperationType.SUBSCRIPTION:
+            root_type = schema.subscription_type
+
+        selections = (
+            operation.selection_set.selections if operation.selection_set else ()
+        )
+        self.cost = self.compute_selection_set_cost(
+            selections, root_type, (), frozenset(), coerced_variables
+        )
+        if self.cost > self.maximum_cost:
+            self.context.report_error(self.get_cost_exceeded_error())
+
+    def get_operation_to_execute(
+        self, document: DocumentNode
+    ) -> OperationDefinitionNode | None:
+        operations = [
+            definition
+            for definition in document.definitions
+            if isinstance(definition, OperationDefinitionNode)
+        ]
+        if self.operation_name is not None:
+            for operation in operations:
+                if operation.name and operation.name.value == self.operation_name:
+                    return operation
+            self.context.report_error(
+                GraphQLError(f'Unknown operation named "{self.operation_name}".')
+            )
+            return None
+        if len(operations) > 1:
+            self.context.report_error(
+                GraphQLError(
+                    "Must provide operation name "
+                    "if query contains multiple operations."
+                )
+            )
+            return None
+        if operations:
+            return operations[0]
+        return None
+
+    def get_coerced_variables(
+        self, operation: OperationDefinitionNode
+    ) -> dict | None:
+        result = get_variable_values(
+            self.context.schema,
+            operation.variable_definitions or (),
+            self.variables or {},
+        )
+        if isinstance(result, list):
+            for error in result:
+                self.context.report_error(error)
+            return None
+        return result
+
+    def compute_selection_set_cost(
+        self,
+        selections,
+        type_def,
+        multipliers: tuple[int, ...],
+        visited_fragments: frozenset,
+        variable_values: dict,
+    ) -> int:
+        if type_def is None:
+            return 0
+        if isinstance(type_def, GraphQLInterfaceType | GraphQLUnionType):
+            # Abstract types are billed as the most expensive concrete type
+            # that may actually run, not as a sum of all possible types.
+            return max(
+                (
+                    self.compute_selection_set_cost(
+                        selections,
+                        possible_type,
+                        multipliers,
+                        visited_fragments,
+                        variable_values,
+                    )
+                    for possible_type in self.context.schema.get_possible_types(
+                        type_def
+                    )
+                ),
+                default=0,
+            )
+
+        fields: GraphQLFieldMap = {}
+        if isinstance(type_def, GraphQLObjectType | GraphQLInterfaceType):
+            fields = type_def.fields
+
+        field_groups: dict[str, list[FieldNode]] = {}
+        fragment_selections: list[SelectionNode] = []
+        for selection in selections:
+            if not self.should_include_selection(selection, variable_values):
+                continue
+            if isinstance(selection, FieldNode):
+                response_key = (
+                    selection.alias.value if selection.alias else selection.name.value
+                )
+                field_groups.setdefault(response_key, []).append(selection)
+            else:
+                fragment_selections.append(selection)
+
+        total = 0
+        for group in field_groups.values():
+            total += self.compute_merged_field_cost(
+                group, type_def, fields, multipliers, visited_fragments,
+                variable_values,
+            )
+        for selection in fragment_selections:
+            total += self.compute_fragment_selection_cost(
+                selection, type_def, multipliers, visited_fragments, variable_values
+            )
+        return total
+
+    def compute_merged_field_cost(
+        self,
+        group: list[FieldNode],
+        type_def,
+        fields: GraphQLFieldMap,
+        multipliers: tuple[int, ...],
+        visited_fragments: frozenset,
+        variable_values: dict,
+    ) -> int:
+        node = group[0]
+        field = fields.get(node.name.value)
+        if not field:
+            return 0
+        field_type = get_named_type(field.type)
+        try:
+            field_args: dict[str, Any] = get_argument_values(
+                field, node, variable_values
+            )
+        except Exception as e:
+            report_error(self.context, e)
+            field_args = {}
+
+        cost_args = None
+        if self.cost_map:
+            cost_args = (
+                self.get_args_from_cost_map(node, type_def.name, field_args)
+                if type_def and type_def.name
+                else None
+            )
+        else:
+            if field.ast_node and field.ast_node.directives:
+                cost_args = self.get_args_from_directives(
+                    field.ast_node.directives, field_args
+                )
+            if (
+                cost_args is None
+                and field_type
+                and isinstance(field_type, GraphQLObjectType)
+                and field_type.ast_node
+                and field_type.ast_node.directives
+            ):
+                cost_args = self.get_args_from_directives(
+                    field_type.ast_node.directives, field_args
+                )
+
+        node_cost = self.default_cost
+        child_multipliers = multipliers
+        if cost_args is not None:
+            try:
+                node_cost, child_multipliers = self.compute_aware_cost(
+                    multipliers, **cost_args
+                )
+            except (TypeError, ValueError) as e:
+                report_error(self.context, e)
+
+        child_selections: list[SelectionNode] = [
+            child_selection
+            for child_node in group
+            if child_node.selection_set
+            for child_selection in child_node.selection_set.selections
+        ]
+        return node_cost + self.compute_selection_set_cost(
+            child_selections, field_type, child_multipliers, visited_fragments,
+            variable_values,
+        )
+
+    def compute_fragment_selection_cost(
+        self,
+        node: SelectionNode,
+        type_def,
+        multipliers: tuple[int, ...],
+        visited_fragments: frozenset,
+        variable_values: dict,
+    ) -> int:
+        if isinstance(node, InlineFragmentNode):
+            if node.type_condition and node.type_condition.name:
+                fragment_type = self.context.schema.get_type(
+                    node.type_condition.name.value
+                )
+                if not self.fragment_applies_to_type(fragment_type, type_def):
+                    return 0
+            return self.compute_selection_set_cost(
+                node.selection_set.selections,
+                type_def,
+                multipliers,
+                visited_fragments,
+                variable_values,
+            )
+
+        if isinstance(node, FragmentSpreadNode):
+            fragment_name = node.name.value
+            fragment = self.context.get_fragment(fragment_name)
+            if fragment is None:
+                return 0
+            fragment_type = self.context.schema.get_type(
+                fragment.type_condition.name.value
+            )
+            if not self.fragment_applies_to_type(fragment_type, type_def):
+                return 0
+            if fragment_name in visited_fragments:
+                self.context.report_error(
+                    GraphQLError(
+                        f'Cannot spread fragment "{fragment_name}" within itself.'
+                    )
+                )
+                return 0
+            multiplier_product = reduce(mul, multipliers, 1)
+            cache_key = (
+                fragment_name,
+                getattr(type_def, "name", None),
+                multiplier_product,
+            )
+            if cache_key not in self._operation_aware_fragment_costs:
+                self._operation_aware_fragment_costs[cache_key] = (
+                    self.compute_selection_set_cost(
+                        fragment.selection_set.selections,
+                        type_def,
+                        multipliers,
+                        visited_fragments | {fragment_name},
+                        variable_values,
+                    )
+                )
+            return self._operation_aware_fragment_costs[cache_key]
+
+        return 0
+
+    def fragment_applies_to_type(self, fragment_type, type_def) -> bool:
+        if fragment_type is None or type_def is None:
+            return False
+        if isinstance(fragment_type, GraphQLObjectType):
+            return fragment_type.name == getattr(type_def, "name", None)
+        if isinstance(fragment_type, GraphQLInterfaceType | GraphQLUnionType):
+            return any(
+                possible_type.name == getattr(type_def, "name", None)
+                for possible_type in self.context.schema.get_possible_types(
+                    fragment_type
+                )
+            )
+        return False
+
+    def should_include_selection(self, node, variable_values: dict) -> bool:
+        try:
+            skip = get_directive_values(GraphQLSkipDirective, node, variable_values)
+            if skip and skip.get("if") is True:
+                return False
+            include = get_directive_values(
+                GraphQLIncludeDirective, node, variable_values
+            )
+            if include and include.get("if") is False:
+                return False
+        except Exception as e:
+            report_error(self.context, e)
+        return True
+
+    def compute_aware_cost(
+        self,
+        parent_multipliers: tuple[int, ...],
+        multipliers=None,
+        use_multipliers=True,
+        complexity=None,
+    ) -> tuple[int, tuple[int, ...]]:
+        if complexity is None:
+            complexity = self.default_complexity
+        if use_multipliers:
+            child_multipliers = parent_multipliers
+            if multipliers:
+                child_multipliers = parent_multipliers + (
+                    reduce(add, multipliers, 0),
+                )
+            return reduce(mul, child_multipliers, complexity), child_multipliers
+        return complexity, parent_multipliers
 
     def compute_cost(self, multipliers=None, use_multipliers=True, complexity=None):
         if complexity is None:
@@ -390,6 +720,8 @@ def cost_validator(
     default_complexity: int = 1,
     variables: dict | None = None,
     cost_map: dict[str, dict[str, Any]] | None = None,
+    operation_aware: bool = False,
+    operation_name: str | None = None,
 ) -> type[ASTValidationRule]:
     class _CostValidator(CostValidator):
         def __init__(self, context: ValidationContext) -> None:
@@ -400,6 +732,8 @@ def cost_validator(
                 default_complexity=default_complexity,
                 variables=variables,
                 cost_map=cost_map,
+                operation_aware=operation_aware,
+                operation_name=operation_name,
             )
 
     return cast(type[ASTValidationRule], _CostValidator)

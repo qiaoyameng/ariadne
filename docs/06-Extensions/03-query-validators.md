@@ -158,6 +158,40 @@ Query cost validation runs before query execution. This makes it impossible for 
 To deal with that you should use either multipliers, dynamic query cost configuration or make field's cost high enough in advance.
 
 
+### Operation-aware cost validation
+
+By default `cost_validator` walks the whole query document and sums up costs of all operations and fragments it contains. If your API serves documents containing multiple operations, you can enable the operation-aware mode with the `operation_aware` option. In this mode the validator only bills the operation selected by the request's `operationName`, using the same set of fields that would actually be executed:
+
+```python
+def get_validation_rules(context_value, document, data):
+    return [
+        cost_validator(
+            maximum_cost=5,
+            variables=data.get("variables"),
+            operation_name=data.get("operationName"),
+            operation_aware=True,
+        )
+    ]
+
+
+graphql = Graphql(
+    schema,
+    validation_rules=get_validation_rules,
+)
+```
+
+Operation-aware mode changes the cost calculation in the following ways:
+
+- Only the operation named by `operationName` is billed. If the operation doesn't exist, a GraphQL error is returned and resolvers are never called.
+- Variables are coerced to their GraphQL types before costs are computed, so operation variable defaults and input object defaults are visible to multipliers. Missing required variables produce a regular GraphQL error and prevent execution.
+- `@skip` and `@include` directives are honored: excluded fields and fragments don't add to the cost.
+- Mergeable fields sharing a response key are billed once, while different aliases of the same field are billed separately.
+- Fragments referenced multiple times are billed per spread, but their cost is computed only once per multiplier context, so fragment DAGs don't cause exponential validation times. Cyclic fragments result in a GraphQL error.
+- For fields returning interface or union types, the cost is the maximum cost among the concrete types that may actually run, not the sum of all of them. Fields common to all possible types are always included.
+
+Costs are computed fresh for every request and are never cached between requests, so it's safe to reuse the same `validation_rules` callable for queries with different variables.
+
+
 ## Implementing custom validator
 
 All custom query validators should extend the [`ValidationRule`](https://github.com/graphql-python/graphql-core/blob/v3.0.5/src/graphql/validation/rules/__init__.py#L37) base class importable from the `graphql.validation.rules` module.

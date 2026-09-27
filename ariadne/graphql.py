@@ -136,7 +136,7 @@ async def graphql(
 
     extension_manager = ExtensionManager(extensions, context_value)
 
-    with extension_manager.request():
+    async with extension_manager.request_async():
         try:
             validate_data(data)
             variables, operation_name = (
@@ -163,7 +163,7 @@ async def graphql(
                 query_validator=query_validator,
             )
             if validation_errors:
-                return handle_graphql_errors(
+                return await handle_graphql_errors_async(
                     validation_errors,
                     logger=logger,
                     error_formatter=error_formatter,
@@ -205,7 +205,7 @@ async def graphql(
             if isawaitable(exec_result):
                 exec_result = await exec_result
         except GraphQLError as error:
-            error_result = handle_graphql_errors(
+            error_result = await handle_graphql_errors_async(
                 [error],
                 logger=logger,
                 error_formatter=error_formatter,
@@ -218,7 +218,7 @@ async def graphql(
 
             return error_result
 
-        result = handle_query_result(
+        result = await handle_query_result_async(
             exec_result,
             logger=logger,
             error_formatter=error_formatter,
@@ -558,15 +558,31 @@ def handle_query_result(
     result, *, logger, error_formatter, debug, extension_manager=None
 ) -> GraphQLResult:
     response = {"data": result.data}
+    if extension_manager and result.errors:
+        extension_manager.has_errors(result.errors)
     if result.errors:
         for error in result.errors:
             log_error(error, logger)
         response["errors"] = [error_formatter(error, debug) for error in result.errors]
 
     if extension_manager:
-        if result.errors:
-            extension_manager.has_errors(result.errors)
         add_extensions_to_response(extension_manager, response)
+    return result.data is not None, response
+
+
+async def handle_query_result_async(
+    result, *, logger, error_formatter, debug, extension_manager=None
+) -> GraphQLResult:
+    response = {"data": result.data}
+    if extension_manager and result.errors:
+        await extension_manager.has_errors_async(result.errors)
+    if result.errors:
+        for error in result.errors:
+            log_error(error, logger)
+        response["errors"] = [error_formatter(error, debug) for error in result.errors]
+
+    if extension_manager:
+        await add_extensions_to_response_async(extension_manager, response)
     return result.data is not None, response
 
 
@@ -578,12 +594,31 @@ def handle_graphql_errors(
     debug,
     extension_manager=None,
 ) -> GraphQLResult:
+    if extension_manager:
+        extension_manager.has_errors(errors)
     for error in errors:
         log_error(error, logger)
     response = {"errors": [error_formatter(error, debug) for error in errors]}
     if extension_manager:
-        extension_manager.has_errors(errors)
         add_extensions_to_response(extension_manager, response)
+    return False, response
+
+
+async def handle_graphql_errors_async(
+    errors: Sequence[GraphQLError],
+    *,
+    logger: None | str | Logger | LoggerAdapter,
+    error_formatter,
+    debug,
+    extension_manager=None,
+) -> GraphQLResult:
+    if extension_manager:
+        await extension_manager.has_errors_async(errors)
+    for error in errors:
+        log_error(error, logger)
+    response = {"errors": [error_formatter(error, debug) for error in errors]}
+    if extension_manager:
+        await add_extensions_to_response_async(extension_manager, response)
     return False, response
 
 
@@ -605,6 +640,17 @@ def parse_query(
 
 def add_extensions_to_response(extension_manager: ExtensionManager, response: dict):
     formatted_extensions = extension_manager.format()
+    if formatted_extensions:
+        if "extensions" in response:
+            response["extensions"].update(formatted_extensions)
+        else:
+            response["extensions"] = formatted_extensions
+
+
+async def add_extensions_to_response_async(
+    extension_manager: ExtensionManager, response: dict
+):
+    formatted_extensions = await extension_manager.format_async()
     if formatted_extensions:
         if "extensions" in response:
             response["extensions"].update(formatted_extensions)

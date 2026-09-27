@@ -533,13 +533,27 @@ class Extension:
 
     Subclasses of this class should override default methods to run
     custom logic during Query execution.
+
+    `request_started`, `request_finished`, `has_errors` and `format` hooks
+    may be defined as regular or `async` methods. Asynchronous hooks are
+    awaited by the asynchronous query executor (`graphql`), but are not
+    supported by the synchronous one (`graphql_sync`), which raises
+    `RuntimeError` when a hook returns an awaitable.
     """
 
     def request_started(self, context: ContextValue) -> None:
-        """Extension hook executed at request's start."""
+        """Extension hook executed at request's start.
+
+        May be defined as `async` when used with the asynchronous
+        query executor.
+        """
 
     def request_finished(self, context: ContextValue) -> None:
-        """Extension hook executed at request's end."""
+        """Extension hook executed at request's end.
+
+        May be defined as `async` when used with the asynchronous
+        query executor.
+        """
 
     def resolve(
         self, next_: Resolver, obj: Any, info: GraphQLResolveInfo, **kwargs
@@ -600,11 +614,19 @@ class Extension:
         return next_(obj, info, **kwargs)
 
     def has_errors(self, errors: list[GraphQLError], context: ContextValue) -> None:
-        """Extension hook executed when GraphQL encountered errors."""
+        """Extension hook executed when GraphQL encountered errors.
+
+        May be defined as `async` when used with the asynchronous
+        query executor.
+        """
 
     def format(self, context: ContextValue) -> dict | None:
         """Extension hook executed to retrieve extra data to include in result's
-        `extensions` data."""
+        `extensions` data.
+
+        May be defined as `async` when used with the asynchronous
+        query executor.
+        """
 
 
 @runtime_checkable

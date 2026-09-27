@@ -158,6 +158,39 @@ Query cost validation runs before query execution. This makes it impossible for 
 To deal with that you should use either multipliers, dynamic query cost configuration or make field's cost high enough in advance.
 
 
+### Operation-aware cost validation
+
+By default `cost_validator` walks the whole query document and sums costs of all operations it contains. Passing `operation_aware=True` switches it to an execution-aware mode in which only the operation selected by the request's `operationName` is evaluated, and only the fields that would actually be executed are billed:
+
+- Variables are coerced with full GraphQL type coercion before computing costs, so operation variable defaults and input object defaults are taken into account. Missing required variables are reported as regular GraphQL errors and block the execution.
+- `@skip` and `@include` directives are honored.
+- Mergeable fields sharing a response key are billed once, while different aliases are billed separately.
+- For `interface` and `union` fields, the cost is the maximum cost over the possible concrete types (including fields common to all of them) instead of the sum of mutually exclusive branches.
+- Fragments may be referenced any number of times without repeated re-expansion; fragment cycles are reported as regular GraphQL errors and block the execution.
+
+If the selected operation doesn't exist (or `operationName` is not given while the document contains multiple operations), a regular GraphQL error is returned and resolvers are not executed.
+
+Because the mode depends on request variables and `operationName`, it should be configured dynamically so no costs are shared between requests:
+
+```python
+def get_validation_rules(context_value, document, data):
+    return [
+        cost_validator(
+            maximum_cost=5,
+            variables=data.get("variables"),
+            operation_name=data.get("operationName"),
+            operation_aware=True,
+        )
+    ]
+
+
+graphql = Graphql(
+    schema,
+    validation_rules=get_validation_rules,
+)
+```
+
+
 ## Implementing custom validator
 
 All custom query validators should extend the [`ValidationRule`](https://github.com/graphql-python/graphql-core/blob/v3.0.5/src/graphql/validation/rules/__init__.py#L37) base class importable from the `graphql.validation.rules` module.

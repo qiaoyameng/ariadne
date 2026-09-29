@@ -9,6 +9,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..explorer import Explorer, ExplorerGraphiQL
 from ..format_error import format_error
+from ..persisted_queries import PersistedQueryStore
 from ..types import (
     ContextValue,
     ErrorFormatter,
@@ -49,6 +50,7 @@ class GraphQL:
         execution_context_class: type[ExecutionContext] | None = None,
         http_handler: GraphQLHTTPHandler | None = None,
         websocket_handler: GraphQLWebsocketHandlerBase | None = None,
+        persisted_query_store: PersistedQueryStore | None = None,
     ) -> None:
         """Initializes the ASGI app and it's http and websocket handlers.
 
@@ -110,11 +112,18 @@ class GraphQL:
         implementing the websocket connections handling logic for this server.
         If not set, `GraphQLWSHandler` will be used, implementing older
         version of GraphQL subscriptions protocol.
+
+        `persisted_query_store`: a `PersistedQueryStore` to use for automatic
+        persisted queries support. Defaults to `None` which disables the
+        feature.
         """
         if http_handler:
             self.http_handler = http_handler
         else:
             self.http_handler = GraphQLHTTPHandler()
+
+        if persisted_query_store is not None:
+            self.http_handler.persisted_query_store = persisted_query_store
 
         if websocket_handler:
             self.websocket_handler = websocket_handler

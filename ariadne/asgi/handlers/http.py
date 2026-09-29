@@ -5,7 +5,7 @@ from http import HTTPStatus
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, cast
 
-from graphql import DocumentNode, MiddlewareManager
+from graphql import DocumentNode, GraphQLError, MiddlewareManager
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -19,6 +19,11 @@ from ...exceptions import HttpBadRequestError, HttpError
 from ...explorer import Explorer
 from ...file_uploads import combine_multipart_data
 from ...graphql import graphql
+from ...persisted_queries import (
+    PersistedQueryStore,
+    register_persisted_query,
+    resolve_persisted_query,
+)
 from ...types import (
     ContextValue,
     ExtensionList,
@@ -46,6 +51,7 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         middleware: Middlewares | None = None,
         middleware_manager_class: type[MiddlewareManager] | None = None,
         subscription_handlers: list[SubscriptionHandler] | None = None,
+        persisted_query_store: PersistedQueryStore | None = None,
     ) -> None:
         """Initializes the HTTP handler.
 
@@ -67,6 +73,10 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         `subscription_handlers`: a list of `SubscriptionHandler` instances to
         handle GraphQL subscriptions. Handlers are tried in order; the first
         handler whose `supports()` method returns `True` handles the request.
+
+        `persisted_query_store`: a `PersistedQueryStore` to use for automatic
+        persisted queries support. Defaults to `None` which disables the
+        feature.
         """
         super().__init__()
 
@@ -76,6 +86,7 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         self.subscription_handlers: list[SubscriptionHandler] = (
             subscription_handlers or []
         )
+        self.persisted_query_store = persisted_query_store
 
     async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
         """An entrypoint for the GraphQL HTTP handler.
@@ -144,7 +155,7 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
             return response
 
         if request.method == "GET":
-            if self.execute_get_queries and request.query_params.get("query"):
+            if self.execute_get_queries and self.should_handle_get_query(request):
                 return await self.graphql_http_server(request)
             if self.introspection and self.explorer:
                 # only render explorer when introspection is enabled
@@ -220,8 +231,62 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
                         error_formatter=self.error_formatter,
                     )
 
+        persisted_query_hash: str | None = None
+        if self.persisted_query_store is not None:
+            try:
+                data, persisted_query_hash = resolve_persisted_query(
+                    data, self.persisted_query_store
+                )
+            except GraphQLError as error:
+                return await self.create_json_response(
+                    request, self.format_graphql_error(error), False
+                )
+
         success, result = await self.execute_graphql_query(request, data)
+
+        if (
+            persisted_query_hash is not None
+            and self.persisted_query_store is not None
+            and isinstance(data, dict)
+            and "data" in result
+        ):
+            try:
+                register_persisted_query(
+                    self.persisted_query_store, persisted_query_hash, data["query"]
+                )
+            except GraphQLError as error:
+                return await self.create_json_response(
+                    request, self.format_graphql_error(error), False
+                )
+
         return await self.create_json_response(request, result, success)
+
+    def format_graphql_error(self, error: GraphQLError) -> dict:
+        """Formats a `GraphQLError` into a JSON-serializable response result.
+
+        # Required arguments
+
+        `error`: a `GraphQLError` instance to format.
+        """
+        return {"errors": [self.error_formatter(error, self.debug)]}
+
+    def should_handle_get_query(self, request: Request) -> bool:
+        """Checks if the GET request should be handled as a GraphQL query.
+
+        Returns `True` when the request has a `query` querystring argument or
+        an `extensions` argument that may contain a persisted query (and the
+        persisted query store is configured).
+
+        # Required arguments
+
+        `request`: the `Request` instance from Starlette or FastAPI.
+        """
+        if request.query_params.get("query"):
+            return True
+        return bool(
+            self.persisted_query_store is not None
+            and request.query_params.get("extensions")
+        )
 
     async def extract_data_from_request(self, request: Request) -> Any:
         """Extracts GraphQL request data from request.
@@ -242,7 +307,7 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         if (
             request.method == "GET"
             and self.execute_get_queries
-            and request.query_params.get("query")
+            and self.should_handle_get_query(request)
         ):
             return self.extract_data_from_get_request(request)
 
@@ -312,11 +377,13 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
 
         `request`: the `Request` instance from Starlette or FastAPI.
         """
-        query = request.query_params["query"].strip()
+        query = request.query_params.get("query", "").strip()
         operation_name = request.query_params.get("operationName", "").strip()
         variables = request.query_params.get("variables", "").strip()
+        extensions = request.query_params.get("extensions", "").strip()
 
         clean_variables = None
+        clean_extensions = None
 
         if variables:
             try:
@@ -326,10 +393,19 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
                     "Variables query arg is not a valid JSON"
                 ) from ex
 
+        if extensions:
+            try:
+                clean_extensions = json.loads(extensions)
+            except (TypeError, ValueError) as ex:
+                raise HttpBadRequestError(
+                    "Extensions query arg is not a valid JSON"
+                ) from ex
+
         return {
-            "query": query,
+            "query": query or None,
             "operationName": operation_name or None,
             "variables": clean_variables,
+            "extensions": clean_extensions,
         }
 
     async def execute_graphql_query(

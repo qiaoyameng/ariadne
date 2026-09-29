@@ -8,6 +8,7 @@ from starlette.types import Receive, Scope, Send
 
 from ...explorer import Explorer
 from ...format_error import format_error
+from ...persisted_queries import PersistedQueryStore
 from ...types import (
     ContextValue,
     ErrorFormatter,
@@ -42,6 +43,7 @@ class GraphQLHandlerBase(ABC):
         self.execute_get_queries: bool = False
         self.execution_context_class: type[ExecutionContext] | None = None
         self.middleware_manager_class: type[MiddlewareManager] | None = None
+        self.persisted_query_store: PersistedQueryStore | None = None
 
     @abstractmethod
     async def handle(self, scope: Scope, receive: Receive, send: Send):

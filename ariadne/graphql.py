@@ -29,6 +29,11 @@ from graphql.validation.rules import ASTValidationRule
 from .extensions import ExtensionManager
 from .format_error import format_error
 from .logger import log_error
+from .persisted_queries import (
+    PersistedQueryStore,
+    register_persisted_query,
+    resolve_persisted_query,
+)
 from .types import (
     BaseProxyRootValue,
     ErrorFormatter,
@@ -63,6 +68,7 @@ async def graphql(
     middleware_manager_class: type[MiddlewareManager] | None = None,
     extensions: ExtensionList | None = None,
     execution_context_class: type[ExecutionContext] | None = None,
+    persisted_query_store: PersistedQueryStore | None = None,
     **kwargs,
 ) -> GraphQLResult:
     """Execute GraphQL query asynchronously.
@@ -129,15 +135,25 @@ async def graphql(
     `execution_context_class`: `ExecutionContext` class to use by query
     executor.
 
+    `persisted_query_store`: a `PersistedQueryStore` to use for automatic
+    persisted queries support. Defaults to `None` which disables the
+    persisted queries support.
+
     `**kwargs`: any kwargs not used by `graphql` are passed to
     `graphql.graphql`.
     """
     result_update: BaseProxyRootValue | None = None
+    persisted_query_registration: tuple[str, str] | None = None
 
     extension_manager = ExtensionManager(extensions, context_value)
 
     with extension_manager.request():
         try:
+            if persisted_query_store is not None and isinstance(data, dict):
+                persisted_query_registration = resolve_persisted_query(
+                    persisted_query_store, data
+                )
+
             validate_data(data)
             variables, operation_name = (
                 data.get("variables"),
@@ -169,6 +185,14 @@ async def graphql(
                     error_formatter=error_formatter,
                     debug=debug,
                     extension_manager=extension_manager,
+                )
+
+            if (
+                persisted_query_registration is not None
+                and persisted_query_store is not None
+            ):
+                register_persisted_query(
+                    persisted_query_store, *persisted_query_registration
                 )
 
             if require_query:
@@ -251,6 +275,7 @@ def graphql_sync(
     middleware_manager_class: type[MiddlewareManager] | None = None,
     extensions: ExtensionList | None = None,
     execution_context_class: type[ExecutionContext] | None = None,
+    persisted_query_store: PersistedQueryStore | None = None,
     **kwargs,
 ) -> GraphQLResult:
     """Execute GraphQL query synchronously.
@@ -317,15 +342,25 @@ def graphql_sync(
     `execution_context_class`: `ExecutionContext` class to use by query
     executor.
 
+    `persisted_query_store`: a `PersistedQueryStore` to use for automatic
+    persisted queries support. Defaults to `None` which disables the
+    persisted queries support.
+
     `**kwargs`: any kwargs not used by `graphql_sync` are passed to
     `graphql.graphql_sync`.
     """
     result_update: BaseProxyRootValue | None = None
+    persisted_query_registration: tuple[str, str] | None = None
 
     extension_manager = ExtensionManager(extensions, context_value)
 
     with extension_manager.request():
         try:
+            if persisted_query_store is not None and isinstance(data, dict):
+                persisted_query_registration = resolve_persisted_query(
+                    persisted_query_store, data
+                )
+
             validate_data(data)
             variables, operation_name = (
                 data.get("variables"),
@@ -357,6 +392,14 @@ def graphql_sync(
                     error_formatter=error_formatter,
                     debug=debug,
                     extension_manager=extension_manager,
+                )
+
+            if (
+                persisted_query_registration is not None
+                and persisted_query_store is not None
+            ):
+                register_persisted_query(
+                    persisted_query_store, *persisted_query_registration
                 )
 
             if require_query:

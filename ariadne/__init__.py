@@ -17,6 +17,7 @@ from .inputs import InputType
 from .interfaces import InterfaceType
 from .load_schema import load_schema_from_path
 from .objects import MutationType, ObjectType, QueryType
+from .persisted_queries import InMemoryPersistedQueryStore, PersistedQueryStore
 from .resolvers import (
     is_default_resolver,
     resolve_to,
@@ -43,10 +44,12 @@ __all__ = [
     "EnumType",
     "Extension",
     "ExtensionManager",
+    "InMemoryPersistedQueryStore",
     "InputType",
     "InterfaceType",
     "MutationType",
     "ObjectType",
+    "PersistedQueryStore",
     "QueryType",
     "ScalarType",
     "SchemaBindable",

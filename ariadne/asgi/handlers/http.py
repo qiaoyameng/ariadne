@@ -19,6 +19,7 @@ from ...exceptions import HttpBadRequestError, HttpError
 from ...explorer import Explorer
 from ...file_uploads import combine_multipart_data
 from ...graphql import graphql
+from ...persisted_queries import PersistedQueryStore
 from ...types import (
     ContextValue,
     ExtensionList,
@@ -46,6 +47,7 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         middleware: Middlewares | None = None,
         middleware_manager_class: type[MiddlewareManager] | None = None,
         subscription_handlers: list[SubscriptionHandler] | None = None,
+        persisted_query_store: PersistedQueryStore | None = None,
     ) -> None:
         """Initializes the HTTP handler.
 
@@ -67,12 +69,17 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         `subscription_handlers`: a list of `SubscriptionHandler` instances to
         handle GraphQL subscriptions. Handlers are tried in order; the first
         handler whose `supports()` method returns `True` handles the request.
+
+        `persisted_query_store`: a `PersistedQueryStore` to use for automatic
+        persisted queries support. Defaults to `None` which disables the
+        persisted queries support.
         """
         super().__init__()
 
         self.extensions = extensions
         self.middleware = middleware
         self.middleware_manager_class = middleware_manager_class or MiddlewareManager
+        self.persisted_query_store = persisted_query_store
         self.subscription_handlers: list[SubscriptionHandler] = (
             subscription_handlers or []
         )
@@ -144,7 +151,10 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
             return response
 
         if request.method == "GET":
-            if self.execute_get_queries and request.query_params.get("query"):
+            if self.execute_get_queries and (
+                request.query_params.get("query")
+                or request.query_params.get("extensions")
+            ):
                 return await self.graphql_http_server(request)
             if self.introspection and self.explorer:
                 # only render explorer when introspection is enabled
@@ -242,7 +252,10 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         if (
             request.method == "GET"
             and self.execute_get_queries
-            and request.query_params.get("query")
+            and (
+                request.query_params.get("query")
+                or request.query_params.get("extensions")
+            )
         ):
             return self.extract_data_from_get_request(request)
 
@@ -312,11 +325,13 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
 
         `request`: the `Request` instance from Starlette or FastAPI.
         """
-        query = request.query_params["query"].strip()
+        query = request.query_params.get("query", "").strip()
         operation_name = request.query_params.get("operationName", "").strip()
         variables = request.query_params.get("variables", "").strip()
+        extensions = request.query_params.get("extensions", "").strip()
 
         clean_variables = None
+        clean_extensions = None
 
         if variables:
             try:
@@ -326,10 +341,19 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
                     "Variables query arg is not a valid JSON"
                 ) from ex
 
+        if extensions:
+            try:
+                clean_extensions = json.loads(extensions)
+            except (TypeError, ValueError) as ex:
+                raise HttpBadRequestError(
+                    "Extensions query arg is not a valid JSON"
+                ) from ex
+
         return {
             "query": query,
             "operationName": operation_name or None,
             "variables": clean_variables,
+            "extensions": clean_extensions,
         }
 
     async def execute_graphql_query(
@@ -390,6 +414,7 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
             middleware=middleware,
             middleware_manager_class=self.middleware_manager_class,
             execution_context_class=self.execution_context_class,
+            persisted_query_store=self.persisted_query_store,
         )
 
     async def get_extensions_for_request(

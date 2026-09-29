@@ -24,6 +24,7 @@ from .explorer import Explorer, ExplorerGraphiQL
 from .file_uploads import combine_multipart_data
 from .format_error import format_error
 from .graphql import graphql_sync
+from .persisted_queries import PersistedQueryStore
 from .types import (
     ContextValue,
     ErrorFormatter,
@@ -75,6 +76,7 @@ class GraphQL:
         middleware: Middlewares | None = None,
         middleware_manager_class: type[MiddlewareManager] | None = None,
         execution_context_class: type[ExecutionContext] | None = None,
+        persisted_query_store: PersistedQueryStore | None = None,
     ) -> None:
         """Initializes the WSGI app.
 
@@ -140,6 +142,10 @@ class GraphQL:
         `execution_context_class`: custom `ExecutionContext` type to use by
         this server to execute the GraphQL queries. Defaults to standard
         context type implemented by the `graphql`.
+
+        `persisted_query_store`: a `PersistedQueryStore` to use for automatic
+        persisted queries support. Defaults to `None` which disables the
+        persisted queries support.
         """
 
         self.context_value = context_value
@@ -156,6 +162,7 @@ class GraphQL:
         self.middleware = middleware
         self.middleware_manager_class = middleware_manager_class or MiddlewareManager
         self.execution_context_class = execution_context_class
+        self.persisted_query_store = persisted_query_store
         self.schema = schema
 
         if explorer:
@@ -253,7 +260,11 @@ class GraphQL:
         `start_response`: a callable used to begin new HTTP response.
         """
         query_params = parse_query_string(environ)
-        if self.execute_get_queries and query_params and query_params.get("query"):
+        if (
+            self.execute_get_queries
+            and query_params
+            and (query_params.get("query") or query_params.get("extensions"))
+        ):
             return self.handle_get_query(environ, start_response, query_params)
         if self.introspection:
             return self.handle_get_explorer(environ, start_response)
@@ -276,11 +287,13 @@ class GraphQL:
 
         `query_params`: a `dict` with parsed query string.
         """
-        query = query_params["query"].strip()
+        query = query_params.get("query", "").strip()
         operation_name = query_params.get("operationName", "").strip()
         variables = query_params.get("variables", "").strip()
+        extensions = query_params.get("extensions", "").strip()
 
         clean_variables = None
+        clean_extensions = None
 
         if variables:
             try:
@@ -290,10 +303,19 @@ class GraphQL:
                     "Variables query arg is not a valid JSON"
                 ) from ex
 
+        if extensions:
+            try:
+                clean_extensions = json.loads(extensions)
+            except (TypeError, ValueError, json.JSONDecodeError) as ex:
+                raise HttpBadRequestError(
+                    "Extensions query arg is not a valid JSON"
+                ) from ex
+
         return {
             "query": query,
             "operationName": operation_name or None,
             "variables": clean_variables,
+            "extensions": clean_extensions,
         }
 
     def handle_get_explorer(self, environ: dict, start_response) -> list[bytes]:
@@ -477,6 +499,7 @@ class GraphQL:
             middleware=middleware,
             middleware_manager_class=self.middleware_manager_class,
             execution_context_class=self.execution_context_class,
+            persisted_query_store=self.persisted_query_store,
         )
 
     def get_context_for_request(self, environ: dict, data: Any) -> ContextValue | None:

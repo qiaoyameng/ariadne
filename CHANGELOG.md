@@ -6,4 +6,7 @@ For released versions, see the [Releases](https://github.com/mirumee/ariadne/rel
 
 ## Unreleased
 
-
+- Added optional automatic persisted queries (APQ) support to ASGI and WSGI
+  applications via the `persisted_query_store` option. Added
+  `PersistedQueryStore` protocol and `InMemoryPersistedQueryStore`
+  implementation with LRU eviction.
